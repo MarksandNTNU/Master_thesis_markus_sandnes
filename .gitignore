@@ -24,11 +24,11 @@ mlflow_artifacts/
 # =========================
 # Generated visualizations & media
 # =========================
-figures/
-animations/
-*.png
-*.gif
-*.mp4
+# figures/
+# animations/
+# *.png
+# *.gif
+# *.mp4
 
 # =========================
 # Python cache / build artifacts
