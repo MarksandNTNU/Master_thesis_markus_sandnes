@@ -184,16 +184,3 @@ def forecast(forecaster, input_data, steps, nsensors):
         input_data[:,-1, :nsensors] = forecast[i]
 
     return torch.stack(forecast, 1)
-
-
-
-
-
-
-
-
-
-
-
-
-

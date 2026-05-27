@@ -1,10 +1,10 @@
-"""Prepare POD-based sensing datasets from a single CSV field file.
+"""Prepare POD-based sensing datasets from one or more CSV field files.
 
 This module builds train/valid/test splits for sensing tasks where:
 - X: sparse sensor measurements at POD-optimal sensor locations (QDEIM)
-- Y: normalized POD coefficients of the full field
+- Y: POD coefficients of the full field (optionally standardized)
 
-The POD basis and normalization are fit on training data only.
+The POD basis and optional output normalization are fit on training data only.
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def _relative_reconstruction_error(
     return float(np.linalg.norm(centered - recon) / denom)
 
 
-def _fit_pod_with_threshold(
+def _select_modes_by_energy(
     train_centered: np.ndarray,
     train_field: np.ndarray,
     valid_field: np.ndarray,
@@ -42,35 +42,38 @@ def _fit_pod_with_threshold(
     min_modes: int,
     max_modes: int,
     random_state: int,
-    reconstruction_treshold: float,
+    energy_threshold: float,
 ) -> tuple[np.ndarray, np.ndarray, int, float, float, float]:
-    threshold = reconstruction_treshold / 100.0
-    best = None
+    """Select the minimum number of POD modes whose cumulative energy (sum of
+    squared singular values) exceeds ``energy_threshold`` percent.
 
-    for modes in range(min_modes, max_modes + 1):
-        _, singular_values, vt = randomized_svd(
-            train_centered,
-            n_components=modes,
-            random_state=random_state,
-        )
-        phi = vt.T.astype(np.float32)
-
-        err_train = _relative_reconstruction_error(train_field, train_mean, phi)
-        err_valid = _relative_reconstruction_error(valid_field, train_mean, phi)
-        err_test = _relative_reconstruction_error(test_field, train_mean, phi)
-        best = (phi, singular_values.astype(np.float32), modes, err_train, err_valid, err_test)
-
-        if max(err_train, err_valid, err_test) <= threshold:
-            return best
-
-    assert best is not None
-    _, _, modes, err_train, err_valid, err_test = best
-    raise ValueError(
-        "Unable to satisfy reconstruction_treshold="
-        f"{reconstruction_treshold:.4g}% with up to {modes} POD modes. "
-        f"Best errors: train={err_train * 100:.4f}%, "
-        f"valid={err_valid * 100:.4f}%, test={err_test * 100:.4f}%."
+    The search is done in a single randomized SVD call with ``max_modes``
+    components, so it is cheap regardless of the chosen threshold.
+    """
+    _, singular_values_all, vt_all = randomized_svd(
+        train_centered,
+        n_components=max_modes,
+        random_state=random_state,
     )
+    energy = singular_values_all ** 2
+    cumulative_pct = np.cumsum(energy) / energy.sum() * 100.0
+
+    exceeded = np.where(cumulative_pct >= energy_threshold)[0]
+    n_modes_sel = int(exceeded[0] + 1) if len(exceeded) > 0 else max_modes
+    n_modes_sel = max(min_modes, min(n_modes_sel, max_modes))
+
+    phi = vt_all[:n_modes_sel].T.astype(np.float32)
+    singular_values = singular_values_all[:n_modes_sel]
+
+    err_train = _relative_reconstruction_error(train_field, train_mean, phi)
+    err_valid = _relative_reconstruction_error(valid_field, train_mean, phi)
+    err_test  = _relative_reconstruction_error(test_field,  train_mean, phi)
+
+    print(
+        f"Energy threshold {energy_threshold:.4g}% reached with {n_modes_sel} modes "
+        f"(cumulative energy = {cumulative_pct[n_modes_sel - 1]:.4f}%)"
+    )
+    return phi, singular_values.astype(np.float32), n_modes_sel, err_train, err_valid, err_test
 
 
 def _validate_split_ratios(train_ratio: float, valid_ratio: float) -> None:
@@ -225,13 +228,54 @@ def _maybe_sequence_splits(
     )
 
 
+def _spatial_derivatives(
+    field: np.ndarray,
+    dx: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (first_derivative, second_derivative) along the last axis.
+
+    Works for both 2-D (n_t, n_x) and 3-D (n_seq, seq_len, n_x) arrays.
+    """
+    d1 = np.gradient(field, dx, axis=-1).astype(np.float32)
+    d2 = np.gradient(d1, dx, axis=-1).astype(np.float32)
+    return d1, d2
+
+
+def _pod_max_sensor_placement(phi: np.ndarray, n_sensors: int) -> np.ndarray:
+    """Select sensors greedily by maximum absolute amplitude in each POD mode.
+
+    For each mode (in order of importance), pick the spatial index with the
+    largest absolute value that has not yet been chosen.  Cycle through modes
+    repeatedly until ``n_sensors`` unique indices are collected.
+    """
+    n_x, n_modes = phi.shape
+    chosen: list[int] = []
+    chosen_set: set[int] = set()
+    mode_idx = 0
+    while len(chosen) < n_sensors:
+        mode = np.abs(phi[:, mode_idx % n_modes])
+        # mask already-chosen indices
+        mask = np.ones(n_x, dtype=bool)
+        for idx in chosen_set:
+            mask[idx] = False
+        candidates = np.where(mask)[0]
+        if len(candidates) == 0:
+            break
+        best = candidates[np.argmax(mode[candidates])]
+        chosen.append(int(best))
+        chosen_set.add(int(best))
+        mode_idx += 1
+    return np.sort(np.array(chosen, dtype=np.int32))
+
+
 def _build_split_arrays(
     split_parts: list[np.ndarray],
     split_name: str,
     sensor_idx: np.ndarray,
     train_mean: np.ndarray,
     phi: np.ndarray,
-    scaler: StandardScaler,
+    scaler: StandardScaler | None,
+    scale_outputs: bool,
     seq_len: int | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     x_parts = []
@@ -241,7 +285,12 @@ def _build_split_arrays(
     for part_idx, part in enumerate(split_parts):
         x = part[:, sensor_idx].astype(np.float32)
         y_unscaled = ((part - train_mean) @ phi).astype(np.float32)
-        y = scaler.transform(y_unscaled).astype(np.float32)
+        if scale_outputs:
+            if scaler is None:
+                raise ValueError("scale_outputs=True requires a fitted scaler.")
+            y = scaler.transform(y_unscaled).astype(np.float32)
+        else:
+            y = y_unscaled
         y_truth = part.astype(np.float32)
 
         if seq_len is not None:
@@ -271,8 +320,11 @@ def prepare_sensing_data(
     transpose: bool = True,
     seq_len: int | None = None,
     stride: int = 1,
-    reconstruction_treshold: float | None = None,
+    energy_threshold: float | None = 99.0,
     sensor_idx: Sequence[int] | np.ndarray | None = None,
+    sensor_placement: str = "qdeim",
+    x_coords: np.ndarray | None = None,
+    scale_outputs: bool = True,
 ) -> Dict[str, Any]:
     """Build sensing inputs/targets from one or multiple full-field CSV files.
 
@@ -280,30 +332,49 @@ def prepare_sensing_data(
         csv_path: Path to one CSV or a list/tuple of CSV paths.
         train_ratio: Fraction for first temporal train split.
         valid_ratio: Fraction for following temporal validation split.
-        n_sensors: Number of sensors to select by QDEIM.  Ignored when
+        n_sensors: Number of sensors to select automatically.  Ignored when
             ``sensor_idx`` is provided.
-        n_modes: Number of POD modes.
+        n_modes: Minimum number of POD modes (also the exact number used when
+            ``energy_threshold`` is None).
         random_state: Random state for randomized SVD.
         transpose: If True, transpose CSV after reading.
-        seq_len: Optional sequence length. If provided, each split is truncated
-            to a multiple of seq_len and reshaped to (n_seq, seq_len, features)
-            within each source trajectory split before concatenation.
+        seq_len: Optional sequence length. If provided, the training split is
+            truncated to a multiple of seq_len and reshaped to
+            (n_seq, seq_len, features). Valid/test are kept as single full
+            sequences (1, n_t, features).
         stride: Temporal downsampling stride (stride=2 keeps every other
             timestep).
-        reconstruction_treshold: Maximum allowed reconstruction error percent
-            for train/valid/test. If provided, n_modes is increased until all
-            splits satisfy this value.
+        energy_threshold: Cumulative POD energy percentage target (0–100).
+            The minimum number of modes whose cumulative squared-singular-value
+            energy exceeds this value is selected, clamped to
+            [n_modes, max_modes]. Set to None to use exactly ``n_modes``.
+            Default is 99.0 (99 %).
         sensor_idx: Optional explicit sensor indices (0-based, within
-            ``[0, Nx)``) to use instead of QDEIM placement.  When supplied,
-            ``n_sensors`` is ignored and the provided indices are used directly.
+            ``[0, Nx)``) to use instead of automatic placement.  When supplied,
+            ``n_sensors`` and ``sensor_placement`` are ignored.
+        sensor_placement: Algorithm used when ``sensor_idx`` is None.
+            ``"qdeim"`` (default) — QR-pivoted QDEIM on the POD basis.
+            ``"pod_max"`` — greedily pick the index of maximum absolute
+            amplitude from each POD mode in turn.
+        x_coords: Optional 1-D array of spatial coordinates (length n_x).
+            Used to compute the correct ``dx`` for spatial derivatives.
+            If None, unit spacing (dx=1) is assumed.
+        scale_outputs: If True (default), standardize POD coefficients Y with
+            a training-fit StandardScaler. If False, keep Y unscaled.
 
     Returns:
         Dictionary containing train/valid/test X and Y, plus POD/scaler metadata.
+        Each split sub-dict contains:
+            ``X``       — sensor measurements
+            ``Y``       — POD coefficients (scaled or unscaled)
+            ``Y_truth`` — full reconstructed field
+            ``dY_dx``   — first spatial derivative of the field
+            ``d2Y_dx2`` — second spatial derivative (curvature)
     """
     _validate_split_ratios(train_ratio, valid_ratio)
 
-    if reconstruction_treshold is not None and reconstruction_treshold <= 0:
-        raise ValueError("reconstruction_treshold must be > 0.")
+    if energy_threshold is not None and not (0.0 < energy_threshold <= 100.0):
+        raise ValueError("energy_threshold must be in (0, 100].")
 
     fields, source_files = _load_and_stack_fields(
         csv_path=csv_path,
@@ -341,7 +412,7 @@ def prepare_sensing_data(
     train_mean = train_field.mean(axis=0, keepdims=True)
     train_centered = train_field - train_mean
 
-    if reconstruction_treshold is None:
+    if energy_threshold is None:
         _, singular_values, vt = randomized_svd(
             train_centered,
             n_components=n_modes,
@@ -351,7 +422,7 @@ def prepare_sensing_data(
         n_modes_selected = n_modes
         recon_err_train = _relative_reconstruction_error(train_field, train_mean, phi)
         recon_err_valid = _relative_reconstruction_error(valid_field, train_mean, phi)
-        recon_err_test = _relative_reconstruction_error(test_field, train_mean, phi)
+        recon_err_test  = _relative_reconstruction_error(test_field,  train_mean, phi)
     else:
         (
             phi,
@@ -360,7 +431,7 @@ def prepare_sensing_data(
             recon_err_train,
             recon_err_valid,
             recon_err_test,
-        ) = _fit_pod_with_threshold(
+        ) = _select_modes_by_energy(
             train_centered=train_centered,
             train_field=train_field,
             valid_field=valid_field,
@@ -369,10 +440,10 @@ def prepare_sensing_data(
             min_modes=n_modes,
             max_modes=max_modes,
             random_state=random_state,
-            reconstruction_treshold=reconstruction_treshold,
+            energy_threshold=energy_threshold,
         )
 
-    # Sensor placement: use caller-supplied indices or fall back to QDEIM.
+    # Sensor placement: use caller-supplied indices, or an automatic method.
     if sensor_idx is not None:
         sensor_idx = np.sort(np.asarray(sensor_idx, dtype=np.int32))
         if sensor_idx.ndim != 1 or len(sensor_idx) == 0:
@@ -382,9 +453,15 @@ def prepare_sensing_data(
                 f"sensor_idx values must be in [0, {n_x - 1}], "
                 f"got min={sensor_idx.min()}, max={sensor_idx.max()}."
             )
+    elif sensor_placement == "pod_max":
+        sensor_idx = _pod_max_sensor_placement(phi, n_sensors)
+        print(f"POD-max sensor placement: {sensor_idx.tolist()}")
     else:
+        if sensor_placement != "qdeim":
+            raise ValueError(f"Unknown sensor_placement={sensor_placement!r}. Choose 'qdeim' or 'pod_max'.")
         _, _, pivot_idx = qr(phi @ phi.T, pivoting=True)
         sensor_idx = np.sort(pivot_idx[:n_sensors]).astype(np.int32)
+        print(f"QDEIM sensor placement: {sensor_idx.tolist()}")
 
     y_train_unscaled = ((train_field - train_mean) @ phi).astype(np.float32)
 
@@ -393,7 +470,9 @@ def prepare_sensing_data(
     print(f"POD reconstruction error (valid): {recon_err_valid * 100:.4e} %")
     print(f"POD reconstruction error (test):  {recon_err_test * 100:.4e} %")
 
-    scaler = StandardScaler().fit(y_train_unscaled)
+    scaler: StandardScaler | None = None
+    if scale_outputs:
+        scaler = StandardScaler().fit(y_train_unscaled)
 
     x_train, y_train, y_truth_train = _build_split_arrays(
         split_parts=train_parts,
@@ -402,6 +481,7 @@ def prepare_sensing_data(
         train_mean=train_mean,
         phi=phi,
         scaler=scaler,
+        scale_outputs=scale_outputs,
         seq_len=seq_len,
     )
     x_valid, y_valid, y_truth_valid = _build_split_arrays(
@@ -411,6 +491,7 @@ def prepare_sensing_data(
         train_mean=train_mean,
         phi=phi,
         scaler=scaler,
+        scale_outputs=scale_outputs,
         seq_len=seq_len,
     )
     x_test, y_test, y_truth_test = _build_split_arrays(
@@ -420,19 +501,18 @@ def prepare_sensing_data(
         train_mean=train_mean,
         phi=phi,
         scaler=scaler,
+        scale_outputs=scale_outputs,
         seq_len=seq_len,
     )
 
-    # Build index maps: for each split, record which trajectory indices
-    # belong to which source CSV file. Useful for per-riser-speed analysis.
-    def _compute_source_index_map(parts, split_name):
+    # Build index maps: for each split, record which sequence indices
+    # belong to which source CSV file.
+    def _compute_source_index_map(parts, effective_seq_len):
         index_map = {}
         cursor = 0
         for i, part in enumerate(parts):
-            if seq_len is not None:
-                n_seqs = (part.shape[0] // seq_len)
-                # mirror the halving logic in _truncate_and_reshape_split
-                sl = seq_len
+            if effective_seq_len is not None:
+                sl = effective_seq_len
                 while sl > 0 and part.shape[0] // sl == 0:
                     sl //= 2
                 n_seqs = part.shape[0] // sl if sl > 0 else 0
@@ -443,9 +523,9 @@ def prepare_sensing_data(
         return index_map
 
     source_index = {
-        "train": _compute_source_index_map(train_parts, "train"),
-        "valid": _compute_source_index_map(valid_parts, "valid"),
-        "test":  _compute_source_index_map(test_parts, "test"),
+        "train": _compute_source_index_map(train_parts, seq_len),
+        "valid": _compute_source_index_map(valid_parts, seq_len),
+        "test":  _compute_source_index_map(test_parts,  seq_len),
     }
 
     print(
@@ -465,17 +545,34 @@ def prepare_sensing_data(
         },
     )
 
+    
+    dx = float(np.mean(np.diff(np.asarray(x_coords, dtype=np.float64))))
+
+
+    dy_train,  d2y_train  = _spatial_derivatives(y_truth_train,  dx)
+    dy_valid,  d2y_valid  = _spatial_derivatives(y_truth_valid,  dx)
+    dy_test,   d2y_test   = _spatial_derivatives(y_truth_test,   dx)
+
+    # Spatial derivatives of the POD basis modes (n_x, n_modes) along axis=0.
+    dphi_dx  = np.gradient(phi,  dx, axis=0).astype(np.float32)
+    d2phi_dx2 = np.gradient(dphi_dx, dx, axis=0).astype(np.float32)
+
     return {
         "source_files": source_files,
         "n_source_files": len(source_files),
         "sensor_idx": sensor_idx,
         "pod_basis": phi,
+        "pod_basis_d1": dphi_dx,
+        "pod_basis_d2": d2phi_dx2,
         "singular_values": singular_values.astype(np.float32),
         "n_modes_selected": n_modes_selected,
         "train_mean": train_mean.astype(np.float32),
         "stride": stride,
         "seq_len": seq_len,
-        "reconstruction_treshold": reconstruction_treshold,
+        "energy_threshold": energy_threshold,
+        "scale_outputs": scale_outputs,
+        "x_coords": np.asarray(x_coords, dtype=np.float32) if x_coords is not None else None,
+        "dx": float(dx),
         "reconstruction_error": {
             "train": recon_err_train,
             "valid": recon_err_valid,
@@ -486,9 +583,12 @@ def prepare_sensing_data(
         # Raw split parts kept so sensor extraction can be redone cheaply
         # without re-reading CSVs or re-running POD.  Shape: list of (n_t, n_x).
         "raw_parts": {"train": train_parts, "valid": valid_parts, "test": test_parts},
-        "train": {"X": x_train, "Y": y_train, "Y_truth": y_truth_train},
-        "valid": {"X": x_valid, "Y": y_valid, "Y_truth": y_truth_valid},
-        "test": {"X": x_test, "Y": y_test, "Y_truth": y_truth_test},
+        "train": {"X": x_train, "Y": y_train, "Y_truth": y_truth_train,
+                  "dY_dx": dy_train, "d2Y_dx2": d2y_train},
+        "valid": {"X": x_valid, "Y": y_valid, "Y_truth": y_truth_valid,
+                  "dY_dx": dy_valid, "d2Y_dx2": d2y_valid},
+        "test":  {"X": x_test,  "Y": y_test,  "Y_truth": y_truth_test,
+                  "dY_dx": dy_test,  "d2Y_dx2": d2y_test},
     }
 
 
@@ -516,7 +616,6 @@ def rebuild_sensor_inputs(
 
     phi        = dataset["pod_basis"]
     train_mean = dataset["train_mean"]
-    scaler     = dataset["scaler"]
     seq_len    = dataset["seq_len"]
     raw_parts  = dataset["raw_parts"]
     n_x        = phi.shape[0]
@@ -557,15 +656,27 @@ def save_dataset_npz(dataset: Dict[str, Any], output_path: str | Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    scaler: StandardScaler = dataset["scaler"]
+    scaler: StandardScaler | None = dataset["scaler"]
+    y_dim = int(dataset["pod_basis"].shape[1])
+    scaler_mean = (
+        scaler.mean_.astype(np.float32)
+        if scaler is not None
+        else np.zeros((y_dim,), dtype=np.float32)
+    )
+    scaler_scale = (
+        scaler.scale_.astype(np.float32)
+        if scaler is not None
+        else np.ones((y_dim,), dtype=np.float32)
+    )
     np.savez_compressed(
         output_path,
         sensor_idx=dataset["sensor_idx"],
         pod_basis=dataset["pod_basis"],
         singular_values=dataset["singular_values"],
         train_mean=dataset["train_mean"],
-        scaler_mean=scaler.mean_.astype(np.float32),
-        scaler_scale=scaler.scale_.astype(np.float32),
+        scale_outputs=np.bool_(dataset.get("scale_outputs", True)),
+        scaler_mean=scaler_mean,
+        scaler_scale=scaler_scale,
         X_train=dataset["train"]["X"],
         Y_train=dataset["train"]["Y"],
         Y_train_truth=dataset["train"]["Y_truth"],
@@ -591,20 +702,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-sensors", type=int, default=5, help="Number of QDEIM sensors.")
     parser.add_argument("--n-modes", type=int, default=12, help="Number of POD modes.")
     parser.add_argument(
-        "--reconstruction-treshold",
+        "--energy-threshold",
         type=float,
-        default=None,
+        default=99.0,
         help=(
-            "Maximum reconstruction error percentage allowed for train/valid/test. "
-            "If set, POD modes are increased until this target is met."
+            "Cumulative POD energy percentage target (0–100). "
+            "The minimum number of modes whose cumulative energy exceeds this value "
+            "is selected (clamped to [n_modes, max_modes]). "
+            "Pass 0 or omit to use exactly --n-modes."
         ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Random state for randomized SVD.")
     parser.add_argument(
+        "--seq-len",
         "--se-len",
+        dest="seq_len",
         type=int,
         default=None,
         help="Optional sequence length for train/valid/test reshaping.",
+    )
+    parser.add_argument(
+        "--no-scale-outputs",
+        action="store_true",
+        help="Disable standardization of Y (POD coefficients).",
     )
     parser.add_argument(
         "--stride",
@@ -639,12 +759,14 @@ def main() -> None:
         transpose=not args.no_transpose,
         seq_len=args.seq_len,
         stride=args.stride,
-        reconstruction_treshold=args.reconstruction_treshold,
+        energy_threshold=args.energy_threshold,
+        scale_outputs=not args.no_scale_outputs,
     )
     save_dataset_npz(dataset, args.output)
 
     print(f"Saved dataset to: {args.output}")
     print(f"Source files: {len(dataset['source_files'])}")
+    print(f"Scale outputs: {dataset['scale_outputs']}")
     print(f"Sensors: {dataset['sensor_idx'].tolist()}")
     print(f"X_train: {dataset['train']['X'].shape}, Y_train: {dataset['train']['Y'].shape}")
     print(f"X_valid: {dataset['valid']['X'].shape}, Y_valid: {dataset['valid']['Y'].shape}")

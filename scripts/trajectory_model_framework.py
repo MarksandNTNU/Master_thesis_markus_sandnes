@@ -97,7 +97,7 @@ def run_one_trajectory(csv_path: Path, args: argparse.Namespace) -> Dict[str, An
         transpose=not args.no_transpose,
         seq_len=args.seq_len,
         stride=args.stride,
-        reconstruction_treshold=args.reconstruction_treshold,
+        energy_threshold=args.energy_threshold,
     )
 
     result = {
@@ -165,7 +165,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--valid-ratio", type=float, default=0.1)
     parser.add_argument("--n-sensors", type=int, default=5)
     parser.add_argument("--n-modes", type=int, default=12)
-    parser.add_argument("--reconstruction-treshold", type=float, default=None)
+    parser.add_argument("--energy-threshold", type=float, default=99.0)
     parser.add_argument("--seq-len", type=int, default=1000)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)

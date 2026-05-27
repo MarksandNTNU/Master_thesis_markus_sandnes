@@ -94,15 +94,26 @@ class LSSLKernel(nn.Module):
         self.learn_cd = learn_cd
         if a_init == "nplr":
             lam, P0, _ = make_nplr_legs(state_dim, device=device)
-            self.Lambda_re = nn.Parameter(lam.real.unsqueeze(0).repeat(d_model, 1))
+            neg_re = -lam.real
+            theta_init = torch.log(torch.expm1(neg_re))
+            self.Lambda_re = nn.Parameter(theta_init.unsqueeze(0).repeat(d_model, 1))
             self.Lambda_im = nn.Parameter(lam.imag.unsqueeze(0).repeat(d_model, 1))
             self.P_re = nn.Parameter(P0.real.unsqueeze(0).repeat(d_model, 1))
             self.P_im = nn.Parameter(P0.imag.unsqueeze(0).repeat(d_model, 1))
         else:  # "diagonal"
             lam = _lssl_hippo_diag(state_dim, device=device)
-            self.Lambda_re = nn.Parameter(lam.real.unsqueeze(0).repeat(d_model, 1))
-            self.Lambda_im = nn.Parameter(lam.imag.unsqueeze(0).repeat(d_model, 1))
-        scale = 1.0 / math.sqrt(state_dim) 
+            # lam.real is negative (HiPPO eigenvalues are stable).
+            # We want -softplus(theta) = lam.real, i.e. softplus(theta) = -lam.real.
+            # softplus^{-1}(y) = log(exp(y) - 1) = log(expm1(y)) for y > 0.
+            neg_re = -lam.real  # positive
+            theta_init = torch.log(torch.expm1(neg_re))  # inverse softplus
+            self.Lambda_re = nn.Parameter(
+                theta_init.unsqueeze(0).repeat(d_model, 1)
+            )
+            self.Lambda_im = nn.Parameter(
+                lam.imag.unsqueeze(0).repeat(d_model, 1)
+            )
+        scale = 1.0 / math.sqrt(state_dim)
         self.B_re = nn.Parameter(torch.randn(d_model, state_dim, device=device) * scale)
         self.B_im = nn.Parameter(torch.zeros(d_model, state_dim, device=device))
         if learn_cd:
@@ -244,8 +255,9 @@ class LSSLLayer(nn.Module):
         u = x.transpose(1, 2)
         y = self._fft_conv(u, K) + u * D.unsqueeze(-1)
         y = y.transpose(1, 2)
-        y = self.output_linear(y)
         y = self.dropout(y)
+        y = self.output_linear(y)
+        
         y = y + residual
         if not self.prenorm:
             y = self.norm(y)
@@ -282,9 +294,9 @@ class LSSLStack(nn.Module):
         dropout=0.0,
         prenorm=True,
         device=None,
-        activation=nn.GLU,
+        activation=nn.SiLU,
         a_init="diagonal",
-        decoder_sizes=None,
+        decoder_sizes=[350, 500],
         decoder_act=None,
         learn_cd=False,
     ):
@@ -380,7 +392,6 @@ def train_model(
     Y_vl: np.ndarray,
     *,
     device: torch.device | str = "cpu",
-    optimizer_cls=torch.optim.AdamW,
     loss_fun=None,
     epochs: int = 400,
     batch_size: int = 16,
@@ -415,7 +426,7 @@ def train_model(
         shuffle=False,
     )
 
-    opt = optimizer_cls(model.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=lr_patience, factor=0.5)
 
     best_val = float("inf")
@@ -512,4 +523,4 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     num = np.sqrt(np.sum((y_true - y_pred) ** 2, axis=-1))
     den = np.sqrt(np.sum(y_true ** 2, axis=-1)) + 1e-12
     _mre = np.mean(num / den)
-    return {"mae": f"{_mae:.4e}", "mse": f"{_mse:.4e}", "mre": f"{100 * _mre:.2f}%"}
+    return {"mae": _mae, "mse": _mse, "mre": 100 * _mre}
