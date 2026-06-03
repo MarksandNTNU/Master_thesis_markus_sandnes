@@ -325,6 +325,8 @@ def prepare_sensing_data(
     sensor_placement: str = "qdeim",
     x_coords: np.ndarray | None = None,
     scale_outputs: bool = True,
+    balance_basis: bool = False,
+    balance_basis_method: str = "stride",
 ) -> Dict[str, Any]:
     """Build sensing inputs/targets from one or multiple full-field CSV files.
 
@@ -361,6 +363,15 @@ def prepare_sensing_data(
             If None, unit spacing (dx=1) is assumed.
         scale_outputs: If True (default), standardize POD coefficients Y with
             a training-fit StandardScaler. If False, keep Y unscaled.
+        balance_basis: If True, truncate all training-split parts to the
+            same number of timesteps before constructing the POD basis, fitting
+            the mean/scaler, and building model training sequences.  The target
+            length is the shortest training part (i.e. the highest-riser-speed
+            dataset).  Default is False.
+        balance_basis_method: How to balance when ``balance_basis=True``.
+            ``"stride"`` (default) — subsample each part with a stride so that
+            temporal coverage is preserved (e.g. 30 000 -> stride-3 -> 10 000).
+            ``"truncate"`` — simply discard the tail of each part.
 
     Returns:
         Dictionary containing train/valid/test X and Y, plus POD/scaler metadata.
@@ -395,6 +406,27 @@ def prepare_sensing_data(
         train_parts.append(tr)
         valid_parts.append(vl)
         test_parts.append(te)
+
+    if balance_basis:
+        if balance_basis_method not in ("stride", "truncate"):
+            raise ValueError(
+                f"balance_basis_method must be 'stride' or 'truncate', "
+                f"got {balance_basis_method!r}."
+            )
+        train_lengths = [p.shape[0] for p in train_parts]
+        target_len = min(train_lengths)
+        if balance_basis_method == "stride":
+            balanced = []
+            for p in train_parts:
+                s = max(1, p.shape[0] // target_len)
+                balanced.append(p[::s][:target_len])
+            train_parts = balanced
+        else:  # "truncate"
+            train_parts = [p[:target_len] for p in train_parts]
+        print(
+            f"[balance_basis={balance_basis_method!r}] Train part lengths: "
+            f"{train_lengths} -> all balanced to {target_len} timesteps."
+        )
 
     train_field = np.concatenate(train_parts, axis=0).astype(np.float32)
     valid_field = np.concatenate(valid_parts, axis=0).astype(np.float32)
@@ -571,6 +603,8 @@ def prepare_sensing_data(
         "seq_len": seq_len,
         "energy_threshold": energy_threshold,
         "scale_outputs": scale_outputs,
+        "balance_basis": balance_basis,
+        "balance_basis_method": balance_basis_method if balance_basis else None,
         "x_coords": np.asarray(x_coords, dtype=np.float32) if x_coords is not None else None,
         "dx": float(dx),
         "reconstruction_error": {
